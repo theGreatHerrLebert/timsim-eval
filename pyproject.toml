@@ -1,0 +1,14 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "timsim-eval"
+version = "0.1.0"
+description = "Evaluation harness for the timsim v2 simulator: search-output parsing (DiaNN/Sage/FragPipe), ground-truth comparison, metrics, plots, HTML report. Imspy-free on the DiaNN path."
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = ["pandas>=2.0", "numpy>=1.26", "scipy>=1.7", "matplotlib>=3.8", "pyarrow>=13"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/timsim_eval"]
