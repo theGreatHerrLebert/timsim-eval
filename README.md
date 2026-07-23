@@ -1,21 +1,38 @@
 # timsim-eval
 
-The **evaluation / validation harness** for the [timsim](https://github.com/theGreatHerrLebert/timsim)
-v2 simulator: it takes a search engine's output (DiaNN / Sage / FragPipe) run over a *simulated* dataset,
-compares the identifications against the render's **ground-truth manifest**, and produces metrics, plots,
-and an HTML report — so you can answer "how realistic is the synthetic run?" quantitatively.
+A **benchmark harness built on a known answer key.** [timsim](https://github.com/theGreatHerrLebert/timsim)
+renders a synthetic proteomics run whose every precursor is known ground truth; `timsim-eval` takes a
+search engine's output over that run (DiaNN / Sage / FragPipe), scores it against the truth, and reports
+hierarchical recall, false-discovery proportion, recall-by-abundance, RT / ion-mobility / intensity
+agreement — as metrics, plots, and a self-contained HTML report.
 
-Lifted out of the `imspy-simulation` monorepo package so the [`timsim-necro`](https://github.com/theGreatHerrLebert/timsim-necro)
-DAG's benchmarking step ingests only what it needs. The core (DiaNN-based) eval path is **imspy-free**.
+Because the truth is a **fixed oracle**, the same measurement answers three different questions depending
+on what you hold still and what you vary:
+
+| you're asking | fix | vary | the number tells you |
+|---|---|---|---|
+| **Is the simulation realistic?** | the search tool | the render / predictors | did the simulator get more real |
+| **Which tool is better?** | the rendered dataset | the engine (DiaNN vs Sage vs FragPipe) | a head-to-head on identical ground truth |
+| **Did my software regress?** | the rendered dataset | *your* tool's version / config | whether a change helped or broke recall/FDP |
+
+The first is simulator development; the second and third are why the harness ships `diann_executor`,
+`sage_executor`, `fragpipe_executor`, and `tool_comparison` — a synthetic run with a real answer key is a
+benchmark and a regression test for **any** DIA tool, not only for the simulator that made it.
+
+Lifted out of the `imspy-simulation` monorepo package so consumers ingest only what they need — e.g. the
+[`timsim-necro`](https://github.com/theGreatHerrLebert/timsim-necro) DAG's score node and its
+`golden/` regression gate. The core (DiaNN-based) path is **imspy-free**.
 
 ## What it does
 
-- **Parse** search output into a common schema (`parsing.py`, `sage_parsing.py`, `diann_*`).
-- **Compare** IDs vs. the simulator's ground truth — precursor/peptide/protein recall, FDR calibration,
+- **Parse** any engine's output into a common schema (`parsing.py`, `sage_parsing.py`, `diann_*`) — the
+  adapter layer that lets one scorer compare tools that report results differently.
+- **Compare** IDs vs. ground truth — hierarchical precursor/peptide/protein recall, FDR calibration,
   RT / ion-mobility / intensity agreement (`comparison.py`, `metrics.py`).
+- **Compare tools** — `tool_comparison.py` puts multiple engines' scores side by side on one dataset.
 - **Report** — plots + a self-contained HTML report (`report.py`, `plots.py`).
-- **Drive** — `v2_thermo_eval` (Thermo `.raw` → DiaNN → eval) is the entry point the DAG calls;
-  `runner.py` orchestrates multi-run sweeps.
+- **Drive** — `v2_thermo_eval` (score one report vs one truth) is the entry point the DAG calls;
+  `runner.py` orchestrates multi-run / multi-tool sweeps.
 
 ```bash
 python -m timsim_eval.v2_thermo_eval --help
