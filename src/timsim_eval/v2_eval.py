@@ -26,7 +26,7 @@ from .comparison import (
     match_results,
 )
 from .metrics import ValidationMetrics, ValidationThresholds, check_thresholds
-from .parsing import parse_diann_report
+from .parsing import parse_diann_report, replace_I_with_L
 from .v2_truth import build_truth_from_v2
 
 _CORR_FIELDS = (
@@ -88,16 +88,41 @@ def recall_by_abundance(truth_df, identified_prec_set, n_bins=5):
     return out
 
 
-def score(report_df, truth_df, thresholds=None, n_abundance_bins=5):
+def _precursor_key_column(df):
+    """The normalized ``(sequence, charge)`` key per row — matches ``create_peptide_sets`` (plain
+    sequence, I→L). Used to drop background-derived rows from the report."""
+    seq = df["sequence_normalized"] if "sequence_normalized" in df.columns else df["sequence"].apply(replace_I_with_L)
+    return list(zip(seq, df["charge"]))
+
+
+def score(report_df, truth_df, thresholds=None, n_abundance_bins=5, background_report_df=None):
     """Score a parsed report frame against a v2 truth frame → a ``ValidationMetrics``.
 
     Backbone matching: identification on ``(sequence, charge)`` sets; correlations on the
     ground-truth rows that DiaNN matched; recall stratified into ``n_abundance_bins`` quantiles.
+
+    ``background_report_df`` (optional): a DiaNN report from a **noise-only control run** (A2 real-data
+    noise on, synthetic signal off, same seed). IDs it contains are real peptides from the reference
+    blank — the search engine legitimately finds them in the injected background — so they must NOT count
+    as false positives against our synthetic answer key. We subtract them from the report before scoring,
+    but never a key that is also a true synthetic hit (``background − ground_truth``). Without this,
+    measured FDP is inflated by real background IDs even though the sample is a "blank". See REALISM_PLAN.
     """
     thresholds = thresholds or ValidationThresholds()
     # Collapse to backbone precursors so every scorer counts precursors identically (see docstring).
     truth_df = aggregate_to_backbone(truth_df)
     _, gt_prec = create_peptide_sets(truth_df, use_modifications=False, normalize=True)
+
+    n_background_subtracted = 0
+    if background_report_df is not None and len(background_report_df):
+        _, bg_prec = create_peptide_sets(background_report_df, use_modifications=False, normalize=True)
+        bg_only = bg_prec - gt_prec  # background IDs that are NOT true synthetic hits
+        if bg_only:
+            keys = _precursor_key_column(report_df)
+            keep = pd.Series([k not in bg_only for k in keys], index=report_df.index)
+            n_background_subtracted = int((~keep).sum())
+            report_df = report_df[keep].copy()
+
     _, id_prec = create_peptide_sets(report_df, use_modifications=False, normalize=True)
     idm = calculate_identification_metrics(gt_prec, id_prec)
 
@@ -112,6 +137,7 @@ def score(report_df, truth_df, thresholds=None, n_abundance_bins=5):
         identification_rate=idm["identification_rate"],
         precision=idm["precision"],
         fdr=idm["fdr"],
+        num_background_subtracted=n_background_subtracted,
         **{k: corr.get(k, np.nan) for k in _CORR_FIELDS},
     )
     # Recall stratified by true-abundance quantile — the interpretable form of recall when the truth
@@ -145,6 +171,8 @@ def summary_text(m: ValidationMetrics) -> str:
         f"  identifiable truth : {i['num_ground_truth']:,}",
         f"  identified (TP)    : {i['num_identified']:,}   recall {i['identification_rate']*100:.1f}%",
         f"  false positives    : {i['num_false_positives']:,}   precision {i['precision']*100:.1f}%   FDP {i['fdr']*100:.2f}%",
+        *([f"  background IDs sub : {i['num_background_subtracted']:,}   (real blank peptides, excluded from FDP)"]
+          if i.get('num_background_subtracted') else []),
         f"  RT   Pearson r     : {_fmt(rt['pearson_r'])}   MAE {_fmt(rt['mae_minutes'])} min",
         f"  1/K0 Pearson r     : {_fmt(im['pearson_r'])}   MAE {_fmt(im['mae'], 4)}",
         f"  quant log Pearson  : {_fmt(q['pearson_r'])}   Spearman {_fmt(q['spearman_r'])}",
@@ -193,6 +221,10 @@ def main(argv=None) -> int:
     ap.add_argument("--abundance-bins", type=int, default=5,
                     help="equal-count true-abundance quantiles for the recall breakdown")
     ap.add_argument("--diann-v1", action="store_true", help="report is DiaNN 1.9 (default: 2.x)")
+    ap.add_argument("--background-report", type=Path,
+                    help="DiaNN report from a NOISE-ONLY control run (A2 real-data noise on, synthetic signal "
+                         "off, same seed). Its IDs are real peptides from the reference blank and are "
+                         "subtracted so they don't inflate FDP. Required for a correct FDP when A2 is on.")
     ap.add_argument("--out", type=Path, help="write metrics JSON here")
     a = ap.parse_args(argv)
 
@@ -207,7 +239,10 @@ def main(argv=None) -> int:
 
     report_df = parse_diann_report(report_path, diann_version_2=not a.diann_v1, fdr_threshold=a.fdr)
     truth_df = build_truth_from_v2(str(a.truth_dir), a.n_frames, a.cycle_seconds, sample=a.sample)
-    metrics = score(report_df, truth_df, n_abundance_bins=a.abundance_bins)
+    background_df = None
+    if a.background_report:
+        background_df = parse_diann_report(str(a.background_report), diann_version_2=not a.diann_v1, fdr_threshold=a.fdr)
+    metrics = score(report_df, truth_df, n_abundance_bins=a.abundance_bins, background_report_df=background_df)
 
     print(summary_text(metrics))
     if a.out:

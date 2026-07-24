@@ -49,6 +49,9 @@ class ValidationMetrics:
     identification_rate: float = 0.0
     precision: float = 0.0
     fdr: float = 0.0
+    # A2 real-data noise: report IDs dropped because they came from the reference blank's real background
+    # (a noise-only control run), not from a search error against our synthetic truth. 0 when no background.
+    num_background_subtracted: int = 0
 
     # RT correlation metrics
     rt_pearson_r: float = np.nan
@@ -89,6 +92,7 @@ class ValidationMetrics:
                 "identification_rate": self.identification_rate,
                 "precision": self.precision,
                 "fdr": self.fdr,
+                "num_background_subtracted": self.num_background_subtracted,
             },
             "retention_time": {
                 "pearson_r": self.rt_pearson_r if not np.isnan(self.rt_pearson_r) else None,

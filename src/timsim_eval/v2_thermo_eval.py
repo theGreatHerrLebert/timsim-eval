@@ -36,7 +36,8 @@ def _diann_ids(report_path: str, q_threshold: float) -> set[tuple[str, int]]:
     return set(zip(d[seqcol].astype(str), d["Precursor.Charge"].astype(int)))
 
 
-def score_thermo_dia(report_path, truth_path, peptides_path, q_threshold=0.01, abundance_floor=1e-3):
+def score_thermo_dia(report_path, truth_path, peptides_path, q_threshold=0.01, abundance_floor=1e-3,
+                     background_report_path=None):
     diann = _diann_ids(report_path, q_threshold)
 
     truth = pq.read_table(truth_path).to_pandas()
@@ -46,6 +47,16 @@ def score_thermo_dia(report_path, truth_path, peptides_path, q_threshold=0.01, a
     truth["key"] = list(zip(truth["seq"], truth["charge"].astype(int)))
 
     all_keys = set(truth["key"])
+    # A2 real-data noise: subtract IDs the search finds in the reference blank's real background (a
+    # noise-only control run, same seed) — they are real peptides, not FPs against our synthetic truth, so
+    # counting them would inflate FDP even for a "blank" sample. Never drop a real synthetic hit
+    # (bg_only = background − truth). See REALISM_PLAN.md.
+    background_subtracted = 0
+    if background_report_path:
+        bg_only = _diann_ids(background_report_path, q_threshold) - all_keys
+        background_subtracted = len(diann & bg_only)
+        diann = diann - bg_only
+
     correct = diann & all_keys
     false = diann - all_keys
     fdp = len(false) / max(1, len(diann))
@@ -87,6 +98,7 @@ def score_thermo_dia(report_path, truth_path, peptides_path, q_threshold=0.01, a
         "correct": len(correct),
         "false": len(false),
         "fdp": fdp,
+        "background_subtracted": background_subtracted,
         "q_threshold": q_threshold,
         "abundance_floor": abundance_floor,
         "hierarchy": hierarchy,
@@ -103,13 +115,20 @@ def main(argv=None) -> int:
     ap.add_argument("--fdr", type=float, default=0.01)
     ap.add_argument("--abundance-floor", type=float, default=1e-3,
                     help="detectability floor on abundance for the strictest denominator")
+    ap.add_argument("--background-report", type=Path,
+                    help="DiaNN report from a NOISE-ONLY control run (A2 real-data noise on, synthetic "
+                         "signal off, same seed). Its IDs are real peptides from the reference blank; "
+                         "subtracted so they don't inflate FDP. Needed for a correct FDP when A2 is on.")
     ap.add_argument("--out", type=Path, help="write metrics JSON here")
     a = ap.parse_args(argv)
 
     m = score_thermo_dia(str(a.report), str(a.truth), str(a.peptides), q_threshold=a.fdr,
-                         abundance_floor=a.abundance_floor)
+                         abundance_floor=a.abundance_floor,
+                         background_report_path=str(a.background_report) if a.background_report else None)
     print("timsim v2 Thermo Astral DIA eval — DiaNN vs answer key")
     print(f"  DiaNN IDs (q<={a.fdr}): {m['diann_ids']:,}   correct {m['correct']:,} / false {m['false']:,}")
+    if m.get("background_subtracted"):
+        print(f"  background IDs subtracted: {m['background_subtracted']:,}  (real blank peptides, excluded from FDP)")
     print(f"  FDP: {m['fdp']*100:.2f}%   (engine calls not matching truth)")
     print("  recall over a hierarchy of denominators (present -> detectable):")
     for h in m["hierarchy"]:
