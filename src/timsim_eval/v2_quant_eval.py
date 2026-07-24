@@ -70,9 +70,13 @@ def expected_log2fc(design_path: str) -> dict:
 
     d = tomllib.load(open(design_path, "rb"))
     conds = {c["name"]: dict(c["mix"]) for c in d["condition"]}
+    if len(conds) != 2:
+        raise ValueError(f"quant expects exactly 2 conditions, design has {sorted(conds)}")
 
     def resolve(mix):
         rest = [k for k, v in mix.items() if isinstance(v, str) and v == "rest"]
+        if len(rest) > 1:
+            raise ValueError(f"a condition has multiple 'rest' entries: {rest}")
         known = {k: float(v) for k, v in mix.items() if not (isinstance(v, str) and v == "rest")}
         if rest:
             known[rest[0]] = 1.0 - sum(known.values())
@@ -84,12 +88,12 @@ def expected_log2fc(design_path: str) -> dict:
     return {org: math.log2(b[org] / a[org]) for org in a if a.get(org, 0) > 0 and b.get(org, 0) > 0}
 
 
-def _peptide_quant(df: pd.DataFrame, run: str, col: str) -> pd.Series:
+def _peptide_quant(df: pd.DataFrame, run: str, col: str, run_col: str = "Run") -> pd.Series:
     """Per-sequence quantity for one run: sum the (normalized) quantity across charge/mod forms. Zero or
     missing → absent (dropped)."""
-    sub = df[df["Run"] == run]
+    sub = df[df[run_col].astype(str) == str(run)]
     q = sub.groupby("seqL")[col].sum()
-    return q[q > 0]
+    return q[np.isfinite(q) & (q > 0)]  # finite positive only (drop 0/NaN/±inf/negative)
 
 
 def _robust(residuals: np.ndarray, delta: float) -> dict:
@@ -105,9 +109,10 @@ def _robust(residuals: np.ndarray, delta: float) -> dict:
     }
 
 
-def score_quant(report_df, seq2org, expected, run_a, run_b, qvalue=0.01, delta=0.5) -> dict:
-    """Core scorer. ``report_df`` is a joint DiaNN report (rows per Run×precursor); ``run_a``/``run_b`` are
-    the DiaNN ``Run`` names of conditions A (reference) and B. Returns a metrics dict (JSON-serialisable)."""
+def score_quant(report_df, seq2org, expected, run_a, run_b, qvalue=0.01, delta=0.5, run_col="Run") -> dict:
+    """Core scorer. ``report_df`` is a joint DiaNN report (rows per run×precursor); ``run_a``/``run_b`` select
+    conditions A (reference) and B by matching ``run_col`` (``Run`` name, or ``Run.Index`` when a joint
+    search's ``.d`` folders share a name). Returns a metrics dict (JSON-serialisable)."""
     df = report_df.copy()
     if "Q.Value" in df.columns:
         df = df[df["Q.Value"] <= qvalue]
@@ -122,8 +127,8 @@ def score_quant(report_df, seq2org, expected, run_a, run_b, qvalue=0.01, delta=0
     views: dict = {}
     detection: dict = {}
     for view, col in QUANT_COLS.items():
-        qa = _peptide_quant(df, run_a, col)
-        qb = _peptide_quant(df, run_b, col)
+        qa = _peptide_quant(df, run_a, col, run_col)
+        qb = _peptide_quant(df, run_b, col, run_col)
         both = qa.index.intersection(qb.index)
         fc = pd.Series(np.log2(qb[both].values / qa[both].values), index=both)
         org_of = pd.Series({s: seq2org.get(s) for s in both})
@@ -202,21 +207,27 @@ def main(argv=None) -> int:
     ap.add_argument("--occurrences", required=True, type=Path)
     ap.add_argument("--proteome", required=True, type=Path)
     ap.add_argument("--design", required=True, type=Path, help="design.toml (expected ratios)")
-    ap.add_argument("--run-a", required=True, help="DiaNN Run name of condition A (reference)")
-    ap.add_argument("--run-b", required=True, help="DiaNN Run name of condition B")
+    ap.add_argument("--run-col", default="Run.Index",
+                    help="report column selecting the run (default Run.Index — robust when a joint search's "
+                         ".d folders share a name; use 'Run' to select by run name)")
+    ap.add_argument("--run-a", required=True, help="condition A (reference) value in --run-col (e.g. 0)")
+    ap.add_argument("--run-b", required=True, help="condition B value in --run-col (e.g. 1)")
     ap.add_argument("--fdr", type=float, default=0.01)
     ap.add_argument("--delta", type=float, default=0.5, help="log2FC tolerance for %%correct")
     ap.add_argument("--out", type=Path)
     a = ap.parse_args(argv)
 
     report_df = pq.read_table(str(a.report)).to_pandas()
-    runs = set(report_df["Run"].unique())
+    if a.run_col not in report_df.columns:
+        ap.error(f"--run-col {a.run_col!r} not in report (columns include Run, Run.Index)")
+    runs = set(report_df[a.run_col].astype(str).unique())
     for r in (a.run_a, a.run_b):
-        if r not in runs:
-            ap.error(f"run {r!r} not in report (runs: {sorted(runs)})")
+        if str(r) not in runs:
+            ap.error(f"run {r!r} not in report {a.run_col} values: {sorted(runs)}")
     seq2org = build_seq2org(str(a.peptides), str(a.occurrences), str(a.proteome))
     expected = expected_log2fc(str(a.design))
-    m = score_quant(report_df, seq2org, expected, a.run_a, a.run_b, qvalue=a.fdr, delta=a.delta)
+    m = score_quant(report_df, seq2org, expected, a.run_a, a.run_b, qvalue=a.fdr, delta=a.delta,
+                    run_col=a.run_col)
     print(summary_text(m))
     if a.out:
         a.out.parent.mkdir(parents=True, exist_ok=True)
