@@ -29,7 +29,7 @@ import pyarrow.parquet as pq
 
 from .parsing import replace_I_with_L
 
-PHOSPHO = "Phospho"
+PHOSPHO = "Phospho"  # matched by prefix (Phospho, Phospho_S/T/Y — all UniMod:21)
 STY = set("STY")
 
 
@@ -70,7 +70,7 @@ def build_truth_isoforms(truth_path, precursors_path, modforms_path, peptides_pa
         seq = str(row["sequence"])
         out = set()
         for p, n in zip(row["mod_positions"], row["mod_names"]):
-            if n != PHOSPHO:
+            if not str(n).startswith(PHOSPHO):
                 continue
             p = int(p)
             if not (0 <= p < len(seq) and seq[p] in STY):
