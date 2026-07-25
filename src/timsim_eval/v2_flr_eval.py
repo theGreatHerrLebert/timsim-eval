@@ -40,7 +40,7 @@ def localized_sites(modified_sequence: str, tag: str = "UniMod:21") -> frozenset
     while i < len(s):
         if s[i] == "(":
             j = s.index(")", i)
-            if s[i + 1 : j] == tag:
+            if s[i + 1 : j] == tag and pos > 0:  # residue mod; ignore a spurious n-term-position tag
                 sites.add(pos)  # the residue just consumed (1-based)
             i = j + 1
         else:
@@ -62,10 +62,26 @@ def build_truth_isoforms(truth_path, precursors_path, modforms_path, peptides_pa
 
     mf = mf.merge(pep, on="peptide_id", how="left")
     mf["seqL"] = mf["sequence"].astype(str).apply(replace_I_with_L)
-    mf["phos_sites"] = mf.apply(
-        lambda r: frozenset(int(p) + 1 for p, n in zip(r["mod_positions"], r["mod_names"]) if n == PHOSPHO),
-        axis=1,
-    )
+
+    def _sites(row):
+        # 0-based render mod_positions → 1-based to match localized_sites(). FAIL-CLOSED: a phospho must
+        # land on an S/T/Y residue — if it doesn't, the 0-vs-1-based convention is wrong (or the data is),
+        # and every FLR would be silently corrupted. Assert it self-checks against the real modforms.
+        seq = str(row["sequence"])
+        out = set()
+        for p, n in zip(row["mod_positions"], row["mod_names"]):
+            if n != PHOSPHO:
+                continue
+            p = int(p)
+            if not (0 <= p < len(seq) and seq[p] in STY):
+                raise ValueError(
+                    f"phospho position convention mismatch: modform {row['modform_id']} phospho at 0-based "
+                    f"{p} of {seq!r} is not S/T/Y — check mod_positions base (expected 0-based residue index)"
+                )
+            out.add(p + 1)
+        return frozenset(out)
+
+    mf["phos_sites"] = mf.apply(_sites, axis=1)
     mf["n_sty"] = mf["sequence"].astype(str).apply(lambda s: sum(1 for c in s if c in STY))
 
     j = truth.merge(prec, on="precursor_id", how="left").merge(
@@ -84,6 +100,10 @@ def score_flr(report_df, truth_iso, taus=None, target_flr=0.01, qvalue=0.01) -> 
     """FLR(τ) curve over the isolated single-isomer, ≥2-candidate-site eligible set."""
     taus = taus if taus is not None else [round(x, 2) for x in np.arange(0.0, 1.001, 0.05)]
     df = report_df.copy()
+    # Single-run only: the "most-confident row per (seqL,charge)" dedup below would cherry-pick the best
+    # localization across runs/features and make FLR optimistic. The per-sample phospho search is one run.
+    if "Run" in df.columns and df["Run"].nunique() > 1:
+        raise ValueError(f"FLR expects a single-run report; got runs {sorted(df['Run'].unique())}")
     if "Q.Value" in df.columns:
         df = df[df["Q.Value"] <= qvalue]
     df["seqL"] = df["Stripped.Sequence"].astype(str).apply(replace_I_with_L)
@@ -100,8 +120,10 @@ def score_flr(report_df, truth_iso, taus=None, target_flr=0.01, qvalue=0.01) -> 
     }
     n_multi_isomer = sum(1 for v in truth_iso.values() if len(v["sites"]) >= 2)
 
-    # One DiaNN phospho call per (seqL, charge): the most confident single-phospho row.
+    # One DiaNN phospho call per (seqL, charge): the most confident single-phospho row. Drop non-finite
+    # localization confidences first (a NaN would otherwise pass every `conf >= τ` test spuriously).
     ph = df[df["nphos"] == 1].copy()
+    ph = ph[ph[conf_col].apply(lambda x: pd.notna(x) and np.isfinite(x))]
     ph["key"] = list(zip(ph["seqL"], ph[charge_col].astype(int)))
     ph = ph.sort_values(conf_col, ascending=False, kind="mergesort").drop_duplicates("key")
     calls = {k: (r_loc, r_conf) for k, r_loc, r_conf in zip(ph["key"], ph["loc_sites"], ph[conf_col])}
