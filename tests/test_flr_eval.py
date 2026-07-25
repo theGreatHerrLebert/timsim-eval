@@ -1,4 +1,4 @@
-"""Phospho FLR scorer — parser + FLR(τ) curve on synthetic truth/localization."""
+"""Phospho FLR scorer — parser + abundance-aware isolated / dominant metrics."""
 import numpy as np
 import pandas as pd
 
@@ -12,52 +12,59 @@ def test_localized_sites_parser():
     # residues A(1)C(2)K(3)S(4)T(5)R(6); phospho follows T -> {5}
     assert localized_sites("(UniMod:1)AC(UniMod:4)KST(UniMod:21)R") == frozenset({5})
     assert localized_sites("PEPTIDEK") == frozenset()
+    assert localized_sites("(UniMod:21)PEPS(UniMod:21)T") == frozenset({4})  # n-term tag ignored
 
 
-def _case(n=100, n_wrong=15, seed=0):
-    """n eligible single-isomer peptidoforms (2 S/T/Y sites, true phospho on site 3). DiaNN gets
-    n-n_wrong right (site 3, high confidence) and n_wrong wrong (site 7, low confidence)."""
-    rng = np.random.default_rng(seed)
-    truth_iso, rows = {}, []
-    for i in range(n):
-        seqL = f"AASAAASK{i}"  # keeps keys unique; 2 S sites at positions 3 and 7 in the AASAAASK prefix
-        truth_iso[(seqL, 2)] = {"sites": [frozenset({3})], "n_sty": 2}
-        wrong = i >= (n - n_wrong)
-        loc = 7 if wrong else 3
-        conf = rng.uniform(0.5, 0.8) if wrong else rng.uniform(0.9, 1.0)
-        rows.append({"Run": "d", "Stripped.Sequence": seqL, "Precursor.Charge": 2,
-                     "Modified.Sequence": seqL[:loc] + "(UniMod:21)" + seqL[loc:],
+def _report(keys_sites_conf):
+    """keys_sites_conf: list of (seqL, charge, localized_site, confidence)."""
+    rows = []
+    for seqL, z, site, conf in keys_sites_conf:
+        # Modified.Sequence with UniMod:21 after residue `site`
+        pad = "A" * (max(site, 1) + 2)
+        rows.append({"Run": "d", "Stripped.Sequence": seqL, "Precursor.Charge": z,
+                     "Modified.Sequence": pad[:site] + "(UniMod:21)" + pad[site:],
                      "PTM.Site.Confidence": conf, "Q.Value": 0.001})
-    return pd.DataFrame(rows), truth_iso
+    return pd.DataFrame(rows)
 
 
-def test_flr_curve_and_operating_point():
-    rep, truth_iso = _case(n=100, n_wrong=15)
-    m = score_flr(rep, truth_iso, taus=[0.0, 0.85, 0.9, 0.95], target_flr=0.05)
-    assert m["eligible_single_isomer"] == 100
-    c = {r["tau"]: r for r in m["flr_curve"]}
-    # tau=0: all 100 accepted, 15 wrong -> FLR 15%, recall 85 correct/100 eligible
+def test_isolated_flr_curve():
+    # 100 peptidoforms, one DOMINANT isomer (site 3, abundance 100) + a trace isomer (site 7, 1.0 < 10% -> not
+    # present) -> isolated. DiaNN gets 85 right (site 3, high conf), 15 wrong (site 7, low conf).
+    truth, calls = {}, []
+    rng = np.random.default_rng(0)
+    for i in range(100):
+        k = (f"PEP{i}", 2)
+        truth[k] = {"isomers": {frozenset({3}): 100.0, frozenset({7}): 1.0}, "n_sty": 2}
+        wrong = i >= 85
+        calls.append((f"PEP{i}", 2, 7 if wrong else 3, rng.uniform(0.5, 0.8) if wrong else rng.uniform(0.9, 1.0)))
+    m = score_flr(_report(calls), truth, taus=[0.0, 0.9], present_min_frac=0.1)
+    iso = m["isolated"]
+    assert iso["eligible"] == 100 and m["dominant"]["eligible"] == 0
+    c = {r["tau"]: r for r in iso["flr_curve"]}
     assert c[0.0]["n_accepted"] == 100 and abs(c[0.0]["flr"] - 0.15) < 1e-9
-    assert abs(c[0.0]["recall"] - 0.85) < 1e-9
-    # tau=0.9: the 15 wrong calls (conf<0.8) are excluded -> only 85 correct accepted, FLR 0
-    assert c[0.9]["n_accepted"] == 85 and c[0.9]["flr"] == 0.0
-    assert abs(c[0.9]["recall"] - 0.85) < 1e-9
-    # operating point at FLR<=5% exists and is the lowest such tau
-    assert m["operating_point"] is not None and m["operating_point"]["flr"] <= 0.05
+    assert c[0.9]["n_accepted"] == 85 and c[0.9]["flr"] == 0.0  # low-conf wrong calls excluded
 
 
-def test_multi_isomer_excluded_from_primary():
-    rep, truth_iso = _case(n=50, n_wrong=0)
-    # add a co-eluting 2-isomer peptidoform: must NOT count as eligible single-isomer
-    truth_iso[("COELUTES", 2)] = {"sites": [frozenset({3}), frozenset({7})], "n_sty": 2}
-    m = score_flr(rep, truth_iso, taus=[0.0])
-    assert m["eligible_single_isomer"] == 50
-    assert m["n_multi_isomer_coeluting"] == 1
+def test_dominant_and_ambiguous_split():
+    # co-eluting pairs: 60 clear-dominance (site3=100, site7=20 -> ratio 5), 40 ambiguous (100 vs 100).
+    truth, calls = {}, []
+    for i in range(60):
+        k = (f"CLR{i}", 2)
+        truth[k] = {"isomers": {frozenset({3}): 100.0, frozenset({7}): 20.0}, "n_sty": 2}
+        calls.append((f"CLR{i}", 2, 3, 0.95))  # localize to the dominant (site 3) -> correct
+    for i in range(40):
+        k = (f"AMB{i}", 2)
+        truth[k] = {"isomers": {frozenset({3}): 100.0, frozenset({7}): 100.0}, "n_sty": 2}
+        calls.append((f"AMB{i}", 2, 7, 0.95))  # localize to site 7; dominant is 3 (tie->max key) -> counts wrong
+    m = score_flr(_report(calls), truth, taus=[0.0], present_min_frac=0.1, dominance_min=2.0)
+    d = m["dominant"]
+    assert d["eligible"] == 100
+    assert d["clear_dominance"]["eligible"] == 60 and d["ambiguous"]["eligible"] == 40
+    # clear-dominance calls all hit the dominant site -> FLR 0
+    assert d["clear_dominance"]["flr_curve"][0]["flr"] == 0.0
 
 
 def test_single_site_peptide_not_eligible():
-    # a peptide with only ONE candidate S/T/Y site -> localization trivial -> excluded
-    rep, truth_iso = _case(n=10, n_wrong=0)
-    truth_iso[("ONESITE", 2)] = {"sites": [frozenset({3})], "n_sty": 1}
-    m = score_flr(rep, truth_iso, taus=[0.0])
-    assert m["eligible_single_isomer"] == 10  # the n_sty==1 one is excluded
+    truth = {("ONESITE", 2): {"isomers": {frozenset({3}): 100.0}, "n_sty": 1}}  # only 1 candidate STY
+    m = score_flr(_report([("ONESITE", 2, 3, 0.99)]), truth, taus=[0.0])
+    assert m["isolated"]["eligible"] == 0 and m["dominant"]["eligible"] == 0

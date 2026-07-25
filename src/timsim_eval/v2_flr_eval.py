@@ -91,13 +91,48 @@ def build_truth_isoforms(truth_path, precursors_path, modforms_path, peptides_pa
 
     out: dict = {}
     for (seqL, charge), grp in j.groupby(["seqL", "charge"]):
-        present = list({s for s in grp["phos_sites"]})  # distinct isomers present
-        out[(seqL, int(charge))] = {"sites": present, "n_sty": int(grp["n_sty"].iloc[0])}
+        # per distinct phospho isomer (site-set) → summed rendered abundance. Positional isomers of the same
+        # peptidoform (e.g. P@S vs P@T) co-elute, so which one(s) are "present" for a localization call is an
+        # abundance question, resolved by the threshold in score_flr.
+        isomers = grp.groupby("phos_sites")["abundance"].sum().to_dict()  # frozenset(sites) -> abundance
+        out[(seqL, int(charge))] = {"isomers": isomers, "n_sty": int(grp["n_sty"].iloc[0])}
     return out
 
 
-def score_flr(report_df, truth_iso, taus=None, target_flr=0.01, qvalue=0.01) -> dict:
-    """FLR(τ) curve over the isolated single-isomer, ≥2-candidate-site eligible set."""
+def _flr_curve(eligible, calls, taus, target_flr):
+    """FLR(τ) / recall(τ) over an ``{key: true_site frozenset}`` map, given ``{key: (loc, conf)}`` calls.
+    FLR = wrong/accepted (accepted = conf≥τ); recall = correct/|eligible| (so declining can't fake FLR 0)."""
+    curve = []
+    for tau in taus:
+        accepted = correct = 0
+        for key, true_site in eligible.items():
+            call = calls.get(key)
+            if call is None:
+                continue
+            loc, conf = call
+            if conf < tau:
+                continue
+            accepted += 1
+            if loc == true_site:
+                correct += 1
+        curve.append({
+            "tau": tau, "n_accepted": accepted,
+            "flr": ((accepted - correct) / accepted) if accepted else None,
+            "recall": (correct / len(eligible)) if eligible else None,
+        })
+    op = next((r for r in curve if r["flr"] is not None and r["flr"] <= target_flr), None)
+    return curve, op
+
+
+def score_flr(report_df, truth_iso, taus=None, target_flr=0.01, qvalue=0.01,
+              present_min_frac=0.1, dominance_min=2.0) -> dict:
+    """Two abundance-aware localization metrics over ≥2-candidate-site peptidoforms. A single-phospho isomer
+    counts as PRESENT if its rendered abundance ≥ ``present_min_frac`` × the top isomer's (trace isomers
+    don't count). Then:
+    - **isolated** (exactly ONE present isomer) → the clean FLR(τ) primary vs that site;
+    - **dominant** (≥2 present, co-eluting) → dominant-isomer classification: score DiaNN's call against the
+      MOST-ABUNDANT present isomer, stratified by dominance ratio (top/second) — a near-equal mixture
+      (ratio < ``dominance_min``) is genuinely ambiguous, so its FLR floor is the mixing, not the engine."""
     taus = taus if taus is not None else [round(x, 2) for x in np.arange(0.0, 1.001, 0.05)]
     df = report_df.copy()
     # Single-run only: the "most-confident row per (seqL,charge)" dedup below would cherry-pick the best
@@ -109,16 +144,26 @@ def score_flr(report_df, truth_iso, taus=None, target_flr=0.01, qvalue=0.01) -> 
     df["seqL"] = df["Stripped.Sequence"].astype(str).apply(replace_I_with_L)
     df["loc_sites"] = df["Modified.Sequence"].astype(str).apply(localized_sites)
     df["nphos"] = df["loc_sites"].apply(len)
-    conf_col = "PTM.Site.Confidence"
-    charge_col = "Precursor.Charge"
+    conf_col, charge_col = "PTM.Site.Confidence", "Precursor.Charge"
 
-    # Eligible truth: single present isomer, single phospho, ≥2 candidate S/T/Y sites.
-    eligible = {
-        k: v["sites"][0]
-        for k, v in truth_iso.items()
-        if len(v["sites"]) == 1 and len(v["sites"][0]) == 1 and v["n_sty"] >= 2
-    }
-    n_multi_isomer = sum(1 for v in truth_iso.values() if len(v["sites"]) >= 2)
+    # Classify each ≥2-STY peptidoform by its PRESENT single-phospho isomers (abundance-thresholded).
+    isolated, dominant, dom_clear, dom_ambig = {}, {}, {}, {}
+    for key, v in truth_iso.items():
+        if v["n_sty"] < 2:
+            continue
+        singles = {s: a for s, a in v["isomers"].items() if len(s) == 1}
+        if not singles:
+            continue
+        top = max(singles.values())
+        present = {s: a for s, a in singles.items() if a >= present_min_frac * top}
+        if len(present) == 1:
+            isolated[key] = next(iter(present))
+        elif len(present) >= 2:
+            ranked = sorted(present.values(), reverse=True)
+            ratio = ranked[0] / ranked[1] if ranked[1] > 0 else float("inf")
+            top_site = max(present, key=present.get)
+            dominant[key] = top_site
+            (dom_clear if ratio >= dominance_min else dom_ambig)[key] = top_site
 
     # One DiaNN phospho call per (seqL, charge): the most confident single-phospho row. Drop non-finite
     # localization confidences first (a NaN would otherwise pass every `conf >= τ` test spuriously).
@@ -126,61 +171,52 @@ def score_flr(report_df, truth_iso, taus=None, target_flr=0.01, qvalue=0.01) -> 
     ph = ph[ph[conf_col].apply(lambda x: pd.notna(x) and np.isfinite(x))]
     ph["key"] = list(zip(ph["seqL"], ph[charge_col].astype(int)))
     ph = ph.sort_values(conf_col, ascending=False, kind="mergesort").drop_duplicates("key")
-    calls = {k: (r_loc, r_conf) for k, r_loc, r_conf in zip(ph["key"], ph["loc_sites"], ph[conf_col])}
+    calls = {k: (loc, conf) for k, loc, conf in zip(ph["key"], ph["loc_sites"], ph[conf_col])}
 
-    curve = []
-    for tau in taus:
-        accepted = correct = 0
-        for key, true_site in eligible.items():
-            call = calls.get(key)
-            if call is None:
-                continue
-            loc, conf = call
-            if conf is None or conf < tau:
-                continue
-            accepted += 1
-            if loc == true_site:
-                correct += 1
-        wrong = accepted - correct
-        curve.append({
-            "tau": tau,
-            "n_accepted": accepted,
-            "flr": (wrong / accepted) if accepted else None,
-            "recall": (correct / len(eligible)) if eligible else None,
-        })
-
-    # Operating point: the smallest τ whose FLR ≤ target (max recall at that FLR).
-    op = None
-    for row in curve:
-        if row["flr"] is not None and row["flr"] <= target_flr:
-            op = row
-            break
+    iso_curve, iso_op = _flr_curve(isolated, calls, taus, target_flr)
+    dom_curve, dom_op = _flr_curve(dominant, calls, taus, target_flr)
+    clear_curve, _ = _flr_curve(dom_clear, calls, taus, target_flr)
+    ambig_curve, _ = _flr_curve(dom_ambig, calls, taus, target_flr)
 
     return {
-        "eligible_single_isomer": len(eligible),
-        "n_multi_isomer_coeluting": n_multi_isomer,  # SECONDARY task coverage (not scored here)
-        "flr_curve": curve,
-        "operating_point": op,
+        "isolated": {"eligible": len(isolated), "flr_curve": iso_curve, "operating_point": iso_op},
+        "dominant": {
+            "eligible": len(dominant), "flr_curve": dom_curve, "operating_point": dom_op,
+            "clear_dominance": {"eligible": len(dom_clear), "flr_curve": clear_curve},
+            "ambiguous": {"eligible": len(dom_ambig), "flr_curve": ambig_curve},
+        },
         "target_flr": target_flr,
-        "params": {"qvalue": qvalue},
+        "params": {"qvalue": qvalue, "present_min_frac": present_min_frac, "dominance_min": dominance_min},
     }
 
 
-def summary_text(m: dict) -> str:
-    lines = ["timsim v2 phospho FLR — site localization (PRIMARY: isolated single-isomer)"]
-    lines.append(f"  eligible peptidoforms (single isomer, >=2 S/T/Y sites): {m['eligible_single_isomer']:,}")
-    lines.append(f"  co-eluting multi-isomer (secondary task, not in FLR): {m['n_multi_isomer_coeluting']:,}")
-    op = m["operating_point"]
+def _curve_lines(curve, target):
+    op = next((r for r in curve if r["flr"] is not None and r["flr"] <= target), None)
+    out = []
     if op:
-        lines.append(f"  operating point (FLR<={m['target_flr']*100:.0f}%): tau={op['tau']:.2f}  "
-                     f"accepted={op['n_accepted']:,}  FLR={op['flr']*100:.2f}%  recall={op['recall']*100:.1f}%")
-    else:
-        lines.append(f"  no tau reaches FLR<={m['target_flr']*100:.0f}%")
-    lines.append("  FLR / recall vs tau:")
-    for r in m["flr_curve"]:
-        if r["tau"] in (0.0, 0.5, 0.75, 0.9, 0.95, 0.99, 1.0) and r["flr"] is not None:
-            lines.append(f"    tau={r['tau']:.2f}  accepted={r['n_accepted']:>5}  "
-                         f"FLR={r['flr']*100:5.2f}%  recall={r['recall']*100:5.1f}%")
+        out.append(f"    operating point (FLR<={target*100:.0f}%): tau={op['tau']:.2f}  "
+                   f"accepted={op['n_accepted']:,}  FLR={op['flr']*100:.2f}%  recall={op['recall']*100:.1f}%")
+    for r in curve:
+        if r["tau"] in (0.0, 0.5, 0.9, 0.99) and r["flr"] is not None:
+            out.append(f"    tau={r['tau']:.2f}  accepted={r['n_accepted']:>5}  "
+                       f"FLR={r['flr']*100:5.2f}%  recall={r['recall']*100:5.1f}%")
+    return out
+
+
+def summary_text(m: dict) -> str:
+    t = m["target_flr"]
+    lines = ["timsim v2 phospho FLR — site localization (abundance-aware)"]
+    iso = m["isolated"]
+    lines.append(f"  ISOLATED single-isomer (one present isomer, >=2 S/T/Y): {iso['eligible']:,} eligible")
+    lines += _curve_lines(iso["flr_curve"], t) if iso["eligible"] else ["    (none — co-elution dominates; see dominant)"]
+    dom = m["dominant"]
+    lines.append(f"  DOMINANT-isomer classification (co-eluting, score vs top isomer): {dom['eligible']:,} eligible")
+    lines += _curve_lines(dom["flr_curve"], t)
+    lines.append(f"    clear dominance (top/second >= {m['params']['dominance_min']}): "
+                 f"{dom['clear_dominance']['eligible']:,}")
+    lines += ["  " + x for x in _curve_lines(dom["clear_dominance"]["flr_curve"], t)]
+    lines.append(f"    ambiguous (near-equal isomers, FLR floor is the mixing): {dom['ambiguous']['eligible']:,}")
+    lines += ["  " + x for x in _curve_lines(dom["ambiguous"]["flr_curve"], t)]
     return "\n".join(lines)
 
 
@@ -194,12 +230,17 @@ def main(argv=None) -> int:
     ap.add_argument("--peptides", required=True, type=Path)
     ap.add_argument("--fdr", type=float, default=0.01)
     ap.add_argument("--target-flr", type=float, default=0.01)
+    ap.add_argument("--present-min-frac", type=float, default=0.1,
+                    help="an isomer is 'present' if its abundance >= this fraction of the top isomer's")
+    ap.add_argument("--dominance-min", type=float, default=2.0,
+                    help="top/second isomer abundance ratio above which a co-eluting call is 'clear dominance'")
     ap.add_argument("--out", type=Path)
     a = ap.parse_args(argv)
 
     report_df = pq.read_table(str(a.report)).to_pandas()
     truth_iso = build_truth_isoforms(str(a.truth), str(a.precursors), str(a.modforms), str(a.peptides))
-    m = score_flr(report_df, truth_iso, target_flr=a.target_flr, qvalue=a.fdr)
+    m = score_flr(report_df, truth_iso, target_flr=a.target_flr, qvalue=a.fdr,
+                  present_min_frac=a.present_min_frac, dominance_min=a.dominance_min)
     print(summary_text(m))
     if a.out:
         a.out.parent.mkdir(parents=True, exist_ok=True)
