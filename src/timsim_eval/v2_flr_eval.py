@@ -100,12 +100,15 @@ def build_truth_isoforms(truth_path, precursors_path, modforms_path, peptides_pa
 
 
 def _flr_curve(eligible, calls, taus, target_flr):
-    """FLR(τ) / recall(τ) over an ``{key: true_site frozenset}`` map, given ``{key: (loc, conf)}`` calls.
+    """FLR(τ) / recall(τ) over an ``{key: acceptable_positions frozenset}`` map, given ``{key: (loc, conf)}``
+    calls (``loc`` = frozenset of localized positions). A call is CORRECT iff every localized position is an
+    acceptable (genuinely-present) phosphosite (``loc ⊆ acceptable``) — so for a near-equal mixture,
+    localizing to EITHER present site is correct; only a non-phosphorylated residue is a mislocalization.
     FLR = wrong/accepted (accepted = conf≥τ); recall = correct/|eligible| (so declining can't fake FLR 0)."""
     curve = []
     for tau in taus:
         accepted = correct = 0
-        for key, true_site in eligible.items():
+        for key, acceptable in eligible.items():
             call = calls.get(key)
             if call is None:
                 continue
@@ -113,7 +116,7 @@ def _flr_curve(eligible, calls, taus, target_flr):
             if conf < tau:
                 continue
             accepted += 1
-            if loc == true_site:
+            if loc <= acceptable:
                 correct += 1
         curve.append({
             "tau": tau, "n_accepted": accepted,
@@ -146,7 +149,13 @@ def score_flr(report_df, truth_iso, taus=None, target_flr=0.01, qvalue=0.01,
     df["nphos"] = df["loc_sites"].apply(len)
     conf_col, charge_col = "PTM.Site.Confidence", "Precursor.Charge"
 
-    # Classify each ≥2-STY peptidoform by its PRESENT single-phospho isomers (abundance-thresholded).
+    # Classify each ≥2-STY peptidoform by its PRESENT single-phospho isomers (abundance-thresholded). The
+    # value stored is the ACCEPTABLE localized-position set for that stratum (see _flr_curve):
+    #   isolated       → the one present site;
+    #   clear-dominant → the dominant site alone (localizing to the minor form is a miscall);
+    #   ambiguous      → the UNION of present sites (a near-equal mixture has no single right site, so any
+    #                    genuinely-present site is acceptable — scoring vs an arbitrary tie-break would
+    #                    wrongly penalise the other real isomer).
     isolated, dominant, dom_clear, dom_ambig = {}, {}, {}, {}
     for key, v in truth_iso.items():
         if v["n_sty"] < 2:
@@ -161,9 +170,13 @@ def score_flr(report_df, truth_iso, taus=None, target_flr=0.01, qvalue=0.01,
         elif len(present) >= 2:
             ranked = sorted(present.values(), reverse=True)
             ratio = ranked[0] / ranked[1] if ranked[1] > 0 else float("inf")
-            top_site = max(present, key=present.get)
-            dominant[key] = top_site
-            (dom_clear if ratio >= dominance_min else dom_ambig)[key] = top_site
+            if ratio >= dominance_min:
+                acc = max(present, key=present.get)          # the dominant site alone
+                dom_clear[key] = acc
+            else:
+                acc = frozenset().union(*present.keys())     # any present site is acceptable
+                dom_ambig[key] = acc
+            dominant[key] = acc
 
     # One DiaNN phospho call per (seqL, charge): the most confident single-phospho row. Drop non-finite
     # localization confidences first (a NaN would otherwise pass every `conf >= τ` test spuriously).

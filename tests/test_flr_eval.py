@@ -49,19 +49,20 @@ def test_dominant_and_ambiguous_split():
     # co-eluting pairs: 60 clear-dominance (site3=100, site7=20 -> ratio 5), 40 ambiguous (100 vs 100).
     truth, calls = {}, []
     for i in range(60):
-        k = (f"CLR{i}", 2)
-        truth[k] = {"isomers": {frozenset({3}): 100.0, frozenset({7}): 20.0}, "n_sty": 2}
+        truth[(f"CLR{i}", 2)] = {"isomers": {frozenset({3}): 100.0, frozenset({7}): 20.0}, "n_sty": 2}
         calls.append((f"CLR{i}", 2, 3, 0.95))  # localize to the dominant (site 3) -> correct
+    # ambiguous: 30 localize to a PRESENT site (7) -> CORRECT (either real isomer is fine);
+    #            10 localize OFF the present sites (site 5, unphosphorylated) -> wrong.
     for i in range(40):
-        k = (f"AMB{i}", 2)
-        truth[k] = {"isomers": {frozenset({3}): 100.0, frozenset({7}): 100.0}, "n_sty": 2}
-        calls.append((f"AMB{i}", 2, 7, 0.95))  # localize to site 7; dominant is 3 (tie->max key) -> counts wrong
+        truth[(f"AMB{i}", 2)] = {"isomers": {frozenset({3}): 100.0, frozenset({7}): 100.0}, "n_sty": 2}
+        calls.append((f"AMB{i}", 2, 7 if i < 30 else 5, 0.95))
     m = score_flr(_report(calls), truth, taus=[0.0], present_min_frac=0.1, dominance_min=2.0)
     d = m["dominant"]
     assert d["eligible"] == 100
     assert d["clear_dominance"]["eligible"] == 60 and d["ambiguous"]["eligible"] == 40
-    # clear-dominance calls all hit the dominant site -> FLR 0
-    assert d["clear_dominance"]["flr_curve"][0]["flr"] == 0.0
+    assert d["clear_dominance"]["flr_curve"][0]["flr"] == 0.0  # all hit the dominant site
+    # ambiguous: localizing to EITHER present site is correct; only the 10 off-site calls are wrong -> 25%
+    assert abs(d["ambiguous"]["flr_curve"][0]["flr"] - 0.25) < 1e-9
 
 
 def test_single_site_peptide_not_eligible():
